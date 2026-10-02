@@ -1,0 +1,179 @@
+//! 测试夹具:用 git2 构建确定性的临时仓库,不调用命令行 `git`。
+//!
+//! 作者、邮箱与提交时间固定(第 n 次提交时间 = 基准 + n 分钟),
+//! 所以同样的操作序列在任何机器上得到同样的提交 id。
+
+use std::cell::Cell;
+use std::path::Path;
+
+use crate::{CommitId, Repo};
+
+const BASE_TIME: i64 = 1_700_000_000;
+
+pub struct TempRepo {
+    dir: tempfile::TempDir,
+    repo: git2::Repository,
+    commits: Cell<i64>,
+}
+
+impl Default for TempRepo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TempRepo {
+    /// 空仓库,初始分支 `main`。
+    pub fn new() -> Self {
+        let dir = tempfile::tempdir().expect("创建临时目录失败");
+        let repo = git2::Repository::init(dir.path()).expect("git init 失败");
+        repo.set_head("refs/heads/main").expect("设置初始分支失败");
+        Self {
+            dir,
+            repo,
+            commits: Cell::new(0),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn raw_repo(&self) -> &git2::Repository {
+        &self.repo
+    }
+
+    pub fn path(&self) -> &Path {
+        self.dir.path()
+    }
+
+    /// 以 bytegit 的 `Repo` 打开(每次新开一个句柄)。
+    pub fn open(&self) -> Repo {
+        Repo::discover(self.path()).expect("打开临时仓库失败")
+    }
+
+    fn signature(&self) -> git2::Signature<'static> {
+        let n = self.commits.get();
+        git2::Signature::new(
+            "Test",
+            "test@example.com",
+            &git2::Time::new(BASE_TIME + n * 60, 0),
+        )
+        .expect("构造签名失败")
+    }
+
+    /// 写入(必要时创建父目录)但不加入暂存区。
+    pub fn write_untracked(&self, rel: &str, content: &str) -> &Self {
+        let full = self.path().join(rel);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).expect("创建目录失败");
+        }
+        std::fs::write(full, content).expect("写文件失败");
+        self
+    }
+
+    /// 写文件、暂存并提交到当前分支。
+    pub fn commit_file(&self, rel: &str, content: &str, message: &str) -> CommitId {
+        self.write_untracked(rel, content);
+        let mut index = self.repo.index().expect("读取 index 失败");
+        index.add_path(Path::new(rel)).expect("暂存失败");
+        index.write().expect("写 index 失败");
+        let tree = self
+            .repo
+            .find_tree(index.write_tree().expect("写 tree 失败"))
+            .expect("找不到 tree");
+        let sig = self.signature();
+        let parents: Vec<git2::Commit> = match self.repo.head() {
+            Ok(head) => vec![head.peel_to_commit().expect("HEAD 不是提交")],
+            Err(_) => Vec::new(), // 第一次提交
+        };
+        let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+        let oid = self
+            .repo
+            .commit(Some("HEAD"), &sig, &sig, message, &tree, &parent_refs)
+            .expect("提交失败");
+        self.commits.set(self.commits.get() + 1);
+        CommitId::from_oid(oid)
+    }
+
+    /// 在当前 HEAD 创建分支(不切换)。
+    pub fn branch(&self, name: &str) -> &Self {
+        let head = self
+            .repo
+            .head()
+            .expect("创建分支前需要至少一次提交")
+            .peel_to_commit()
+            .expect("HEAD 不是提交");
+        self.repo.branch(name, &head, false).expect("创建分支失败");
+        self
+    }
+
+    /// 切换到已有分支并更新工作区。
+    pub fn checkout(&self, name: &str) -> &Self {
+        let refname = format!("refs/heads/{name}");
+        let obj = self.repo.revparse_single(&refname).expect("分支不存在");
+        self.repo
+            .checkout_tree(&obj, Some(git2::build::CheckoutBuilder::new().force()))
+            .expect("检出失败");
+        self.repo.set_head(&refname).expect("切换 HEAD 失败");
+        self
+    }
+
+    pub fn add_remote(&self, name: &str, url: &str) -> &Self {
+        self.repo.remote(name, url).expect("添加远程失败");
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_operations_give_same_commit_ids() {
+        let a = TempRepo::new();
+        let b = TempRepo::new();
+        let ia = a.commit_file("f.txt", "1", "one");
+        let ib = b.commit_file("f.txt", "1", "one");
+        assert_eq!(ia, ib);
+        let ja = a.commit_file("f.txt", "2", "two");
+        let jb = b.commit_file("f.txt", "2", "two");
+        assert_eq!(ja, jb);
+        assert_ne!(ia, ja);
+    }
+
+    #[test]
+    fn initial_branch_is_main() {
+        let t = TempRepo::new();
+        t.commit_file("f.txt", "1", "one");
+        let head = t.repo.head().unwrap();
+        assert_eq!(head.shorthand().unwrap(), "main");
+    }
+
+    #[test]
+    fn branch_and_checkout_switch_head_and_files() {
+        let t = TempRepo::new();
+        t.commit_file("f.txt", "main-content", "one");
+        t.branch("feature").checkout("feature");
+        t.commit_file("f.txt", "feature-content", "two");
+        t.checkout("main");
+        let content = std::fs::read_to_string(t.path().join("f.txt")).unwrap();
+        assert_eq!(content, "main-content");
+        assert_eq!(t.repo.head().unwrap().shorthand().unwrap(), "main");
+    }
+
+    #[test]
+    fn untracked_file_is_written_but_not_committed() {
+        let t = TempRepo::new();
+        t.commit_file("a.txt", "a", "one");
+        t.write_untracked("sub/b.txt", "b");
+        assert!(t.path().join("sub/b.txt").exists());
+        let tree = t.repo.head().unwrap().peel_to_tree().unwrap();
+        assert!(tree.get_path(Path::new("sub/b.txt")).is_err());
+    }
+
+    #[test]
+    fn add_remote_is_visible_to_git2() {
+        let t = TempRepo::new();
+        t.add_remote("origin", "https://example.com/x.git");
+        let remote = t.repo.find_remote("origin").unwrap();
+        assert_eq!(remote.url().unwrap(), "https://example.com/x.git");
+    }
+}
