@@ -28,6 +28,19 @@ impl TempRepo {
         let dir = tempfile::tempdir().expect("创建临时目录失败");
         let repo = git2::Repository::init(dir.path()).expect("git init 失败");
         repo.set_head("refs/heads/main").expect("设置初始分支失败");
+        // 隔离用户的全局 git 配置:libgit2 会读 ~/.gitconfig,`core.autocrlf` 等会改变
+        // blob 内容与提交 id,让"同样操作得到同样 id"在不同机器上失效。仓库级配置优先于全局。
+        let empty_attributes = repo.path().join("bytegit_empty_attributes");
+        std::fs::write(&empty_attributes, "").expect("写空 attributes 失败");
+        let mut cfg = repo.config().expect("读取仓库配置失败");
+        cfg.set_str("core.autocrlf", "false").expect("配置失败");
+        cfg.set_str("core.eol", "lf").expect("配置失败");
+        cfg.set_str("core.safecrlf", "false").expect("配置失败");
+        cfg.set_str(
+            "core.attributesFile",
+            empty_attributes.to_str().expect("路径不是 UTF-8"),
+        )
+        .expect("配置失败");
         Self {
             dir,
             repo,
@@ -175,5 +188,28 @@ mod tests {
         t.add_remote("origin", "https://example.com/x.git");
         let remote = t.repo.find_remote("origin").unwrap();
         assert_eq!(remote.url().unwrap(), "https://example.com/x.git");
+    }
+
+    #[test]
+    fn crlf_content_is_stored_byte_for_byte_regardless_of_global_git_config() {
+        let t = TempRepo::new();
+        let id = t.commit_file("crlf.txt", "a\r\nb\r\n", "crlf");
+        let commit = t.repo.find_commit(id.oid()).unwrap();
+        let entry = commit
+            .tree()
+            .unwrap()
+            .get_path(Path::new("crlf.txt"))
+            .unwrap();
+        let blob = t.repo.find_blob(entry.id()).unwrap();
+        assert_eq!(blob.content(), b"a\r\nb\r\n");
+    }
+
+    #[test]
+    fn checkout_does_not_rewrite_line_endings() {
+        let t = TempRepo::new();
+        t.commit_file("crlf.txt", "a\r\nb\r\n", "crlf");
+        t.branch("other").checkout("other").checkout("main");
+        let bytes = std::fs::read(t.path().join("crlf.txt")).unwrap();
+        assert_eq!(bytes, b"a\r\nb\r\n");
     }
 }

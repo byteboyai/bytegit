@@ -43,14 +43,19 @@ impl Repo {
         self.inner.is_bare()
     }
 
-    /// 还没有任何提交(HEAD 指向尚未诞生的分支)。
+    /// 仓库里还没有任何引用(没有分支、标签等),即还没有提交。
     ///
-    /// 不用 `git2::Repository::is_empty`:它只认默认分支名为 master 的空仓库,
-    /// 初始分支叫 `main` 时会误报"非空"。
+    /// HEAD 指向尚未诞生的分支**不等于**没有提交:`git checkout --orphan` 之后
+    /// HEAD 未诞生,但其他分支上有提交,此时返回 `false`。
+    ///
+    /// 不直接用 `git2::Repository::is_empty`:它对"空"的判断依赖用户全局配置里的
+    /// `init.defaultBranch`,同一个空仓库在不同机器上结果可能不同。
     pub fn is_empty(&self) -> Result<bool, GitError> {
         match self.inner.head() {
             Ok(_) => Ok(false),
-            Err(e) if e.code() == git2::ErrorCode::UnbornBranch => Ok(true),
+            Err(e) if e.code() == git2::ErrorCode::UnbornBranch => {
+                Ok(self.inner.references()?.next().is_none())
+            }
             Err(e) => Err(GitError::from(e)),
         }
     }
@@ -166,6 +171,15 @@ mod tests {
         let t = TempRepo::new();
         let id = t.commit_file("a.txt", "x", "one");
         t.raw_repo().set_head_detached(id.oid()).unwrap();
+        assert!(!Repo::discover(t.path()).unwrap().is_empty().unwrap());
+    }
+
+    #[test]
+    fn unborn_head_with_commits_on_other_branches_is_not_empty() {
+        // `git checkout --orphan` 之后的状态:HEAD 指向尚未诞生的分支,但仓库里有提交。
+        let t = TempRepo::new();
+        t.commit_file("a.txt", "x", "one");
+        t.raw_repo().set_head("refs/heads/orphan").unwrap();
         assert!(!Repo::discover(t.path()).unwrap().is_empty().unwrap());
     }
 }
