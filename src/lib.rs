@@ -10,6 +10,7 @@ mod history;
 mod id;
 mod info;
 mod repo;
+mod stats;
 mod status;
 #[cfg(any(test, feature = "testutil"))]
 pub mod testutil;

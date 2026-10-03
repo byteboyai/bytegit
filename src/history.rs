@@ -71,7 +71,7 @@ pub struct Patch {
     pub truncated: bool,
 }
 
-fn system_time(secs: i64) -> SystemTime {
+pub(crate) fn system_time(secs: i64) -> SystemTime {
     if secs >= 0 {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs as u64)
     } else {
@@ -79,7 +79,7 @@ fn system_time(secs: i64) -> SystemTime {
     }
 }
 
-fn path_of(delta: &git2::DiffDelta<'_>) -> Option<PathBuf> {
+pub(crate) fn path_of(delta: &git2::DiffDelta<'_>) -> Option<PathBuf> {
     delta
         .new_file()
         .path()
@@ -88,14 +88,12 @@ fn path_of(delta: &git2::DiffDelta<'_>) -> Option<PathBuf> {
 }
 
 impl Repo {
-    /// 从 HEAD 起按提交时间倒序列出提交。带 `path` 时只保留改动过该路径的提交
-    /// (合并提交相对第一父判断,根提交相对空树)。HEAD 未诞生(没有提交)返回
-    /// `GitErrorKind::NoCommits`。
-    pub fn log(&self, opts: LogOptions) -> Result<Vec<CommitSummary>, GitError> {
+    /// 从 HEAD 起的提交遍历(按 `sort` 排序)。HEAD 指向未诞生的分支(还没有提交)时返回
+    /// `GitErrorKind::NoCommits`——libgit2 对这种情况报的是"引用不存在",这里换成明确的分类。
+    pub(crate) fn head_walk(&self, sort: git2::Sort) -> Result<git2::Revwalk<'_>, GitError> {
         let repo = self.raw();
         let mut revwalk = repo.revwalk()?;
         if let Err(e) = revwalk.push_head() {
-            // HEAD 指向未诞生的分支(还没有提交):libgit2 报的是"引用不存在",换成明确的分类。
             return Err(match repo.head() {
                 Err(h) if h.code() == git2::ErrorCode::UnbornBranch => {
                     GitError::new(GitErrorKind::NoCommits, "仓库还没有任何提交")
@@ -103,7 +101,16 @@ impl Repo {
                 _ => e.into(),
             });
         }
-        revwalk.set_sorting(git2::Sort::TIME)?;
+        revwalk.set_sorting(sort)?;
+        Ok(revwalk)
+    }
+
+    /// 从 HEAD 起按提交时间倒序列出提交。带 `path` 时只保留改动过该路径的提交
+    /// (合并提交相对第一父判断,根提交相对空树)。HEAD 未诞生(没有提交)返回
+    /// `GitErrorKind::NoCommits`。
+    pub fn log(&self, opts: LogOptions) -> Result<Vec<CommitSummary>, GitError> {
+        let repo = self.raw();
+        let revwalk = self.head_walk(git2::Sort::TIME)?;
         let pathspec = opts.path.as_ref().map(|p| p.to_string_lossy().into_owned());
 
         let mut out = Vec::new();

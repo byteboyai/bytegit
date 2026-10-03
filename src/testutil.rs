@@ -100,12 +100,35 @@ impl TempRepo {
 
     /// 把当前暂存区原样提交到当前分支(配合 `stage`/`stage_remove` 做一次含多个改动的提交)。
     pub fn commit_staged(&self, message: &str) -> CommitId {
+        self.commit_staged_with(message, self.signature())
+    }
+
+    /// 同 [`TempRepo::commit_file`],但提交时间(作者与提交者相同)固定为 `unix_secs`,
+    /// 用来构造"很久以前的提交""跨天的提交"。
+    pub fn commit_file_at(
+        &self,
+        rel: &str,
+        content: &str,
+        message: &str,
+        unix_secs: i64,
+    ) -> CommitId {
+        self.write_untracked(rel, content).stage(rel);
+        self.commit_staged_at(message, unix_secs)
+    }
+
+    /// 同 [`TempRepo::commit_staged`],提交时间固定为 `unix_secs`。
+    pub fn commit_staged_at(&self, message: &str, unix_secs: i64) -> CommitId {
+        let sig = git2::Signature::new("Test", "test@example.com", &git2::Time::new(unix_secs, 0))
+            .expect("构造签名失败");
+        self.commit_staged_with(message, sig)
+    }
+
+    fn commit_staged_with(&self, message: &str, sig: git2::Signature<'static>) -> CommitId {
         let mut index = self.repo.index().expect("读取 index 失败");
         let tree = self
             .repo
             .find_tree(index.write_tree().expect("写 tree 失败"))
             .expect("找不到 tree");
-        let sig = self.signature();
         let parents: Vec<git2::Commit> = match self.repo.head() {
             Ok(head) => vec![head.peel_to_commit().expect("HEAD 不是提交")],
             Err(_) => Vec::new(), // 第一次提交
@@ -121,6 +144,22 @@ impl TempRepo {
 
     /// 把分支 `other` 合并进当前分支,生成一个两父提交(两边改的文件不能冲突)。
     pub fn merge_commit(&self, other: &str, message: &str) -> CommitId {
+        self.merge_commit_with(other, message, self.signature())
+    }
+
+    /// 同 [`TempRepo::merge_commit`],提交时间固定为 `unix_secs`。
+    pub fn merge_commit_at(&self, other: &str, message: &str, unix_secs: i64) -> CommitId {
+        let sig = git2::Signature::new("Test", "test@example.com", &git2::Time::new(unix_secs, 0))
+            .expect("构造签名失败");
+        self.merge_commit_with(other, message, sig)
+    }
+
+    fn merge_commit_with(
+        &self,
+        other: &str,
+        message: &str,
+        sig: git2::Signature<'static>,
+    ) -> CommitId {
         let ours = self
             .repo
             .head()
@@ -143,7 +182,6 @@ impl TempRepo {
             .repo
             .find_tree(merged.write_tree_to(&self.repo).expect("写 tree 失败"))
             .expect("找不到 tree");
-        let sig = self.signature();
         let oid = self
             .repo
             .commit(Some("HEAD"), &sig, &sig, message, &tree, &[&ours, &theirs])
