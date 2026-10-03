@@ -6,6 +6,7 @@
 mod change;
 mod error;
 mod id;
+mod info;
 mod repo;
 #[cfg(any(test, feature = "testutil"))]
 pub mod testutil;
@@ -13,4 +14,5 @@ pub mod testutil;
 pub use change::ChangeKind;
 pub use error::{GitError, GitErrorKind};
 pub use id::{BlobId, CommitId};
+pub use info::{HeadInfo, Remote};
 pub use repo::Repo;

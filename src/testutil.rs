@@ -133,6 +133,68 @@ impl TempRepo {
         self.repo.remote(name, url).expect("添加远程失败");
         self
     }
+
+    /// 把工作区里的文件加入暂存区(不提交)。
+    pub fn stage(&self, rel: &str) -> &Self {
+        let mut index = self.repo.index().expect("读取 index 失败");
+        index.add_path(Path::new(rel)).expect("暂存失败");
+        index.write().expect("写 index 失败");
+        self
+    }
+
+    /// 从工作区删除文件但不暂存(未暂存的删除)。
+    pub fn delete_file(&self, rel: &str) -> &Self {
+        std::fs::remove_file(self.path().join(rel)).expect("删除文件失败");
+        self
+    }
+
+    /// 从暂存区和工作区一起删除(等价于 `git rm`)。
+    pub fn stage_remove(&self, rel: &str) -> &Self {
+        self.delete_file(rel);
+        let mut index = self.repo.index().expect("读取 index 失败");
+        index.remove_path(Path::new(rel)).expect("移除失败");
+        index.write().expect("写 index 失败");
+        self
+    }
+
+    /// 让 HEAD 脱离分支,指向当前提交。
+    pub fn detach_head(&self) -> &Self {
+        let id = self
+            .repo
+            .head()
+            .expect("detach 前需要至少一次提交")
+            .peel_to_commit()
+            .expect("HEAD 不是提交")
+            .id();
+        self.repo.set_head_detached(id).expect("detach 失败");
+        self
+    }
+
+    /// 制造一个合并冲突:两个分支对同一文件做不同修改,再在 `main` 上合并 `other`,
+    /// 合并停在冲突状态(冲突文件留在 index 里)。结束时位于 `main`。
+    pub fn make_conflict(&self, rel: &str) -> &Self {
+        self.commit_file(rel, "base\n", "base");
+        self.branch("other").checkout("other");
+        self.commit_file(rel, "other\n", "other change");
+        self.checkout("main");
+        self.commit_file(rel, "main\n", "main change");
+        let other = self
+            .repo
+            .find_branch("other", git2::BranchType::Local)
+            .expect("找不到 other 分支")
+            .get()
+            .peel_to_commit()
+            .expect("other 不是提交")
+            .id();
+        let annotated = self
+            .repo
+            .find_annotated_commit(other)
+            .expect("构造 annotated commit 失败");
+        self.repo
+            .merge(&[&annotated], None, None)
+            .expect("合并失败");
+        self
+    }
 }
 
 #[cfg(test)]
