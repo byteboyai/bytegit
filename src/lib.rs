@@ -16,6 +16,7 @@ mod status;
 pub mod testutil;
 #[cfg(feature = "watch")]
 mod watch;
+mod write;
 
 pub use change::ChangeKind;
 pub use content::{Content, ContentLimits, ContentPair};
@@ -27,3 +28,4 @@ pub use repo::Repo;
 pub use status::{FileState, StatusEntry, StatusOptions};
 #[cfg(feature = "watch")]
 pub use watch::{GitChange, IgnoreRules, WatchHandle, WatchOptions, watch};
+pub use write::{CloneOptions, clone, git_available, init};
