@@ -6,6 +6,7 @@
 mod change;
 mod content;
 mod error;
+mod history;
 mod id;
 mod info;
 mod repo;
@@ -16,6 +17,7 @@ pub mod testutil;
 pub use change::ChangeKind;
 pub use content::{Content, ContentLimits, ContentPair};
 pub use error::{GitError, GitErrorKind};
+pub use history::{CommitSummary, FileChange, LogOptions, Patch, Signature};
 pub use id::{BlobId, CommitId};
 pub use info::{HeadInfo, Remote};
 pub use repo::Repo;

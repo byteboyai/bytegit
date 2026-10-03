@@ -13,7 +13,6 @@ macro_rules! object_id {
 
         impl $name {
             // 后续阶段(log/diff)才会在非测试代码里用到这两个转换。
-            #[allow(dead_code)]
             pub(crate) fn from_oid(oid: git2::Oid) -> Self {
                 Self(oid)
             }

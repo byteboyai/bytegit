@@ -11,8 +11,6 @@ pub enum ChangeKind {
 
 impl ChangeKind {
     /// `Unmodified`/`Ignored`/`Untracked`/`Unreadable`/`Conflicted` 不是"变更",返回 `None`。
-    // 后续阶段(commit_files/status)才会在非测试代码里用到。
-    #[allow(dead_code)]
     pub(crate) fn from_delta(delta: git2::Delta) -> Option<Self> {
         match delta {
             git2::Delta::Added => Some(Self::Added),
