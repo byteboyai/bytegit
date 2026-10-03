@@ -18,7 +18,6 @@ macro_rules! object_id {
                 Self(oid)
             }
 
-            #[allow(dead_code)]
             pub(crate) fn oid(self) -> git2::Oid {
                 self.0
             }

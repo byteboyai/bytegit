@@ -60,7 +60,6 @@ impl Repo {
         }
     }
 
-    #[allow(dead_code)] // 后续阶段的方法使用
     pub(crate) fn raw(&self) -> &git2::Repository {
         &self.inner
     }

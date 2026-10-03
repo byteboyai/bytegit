@@ -4,6 +4,7 @@
 //! `docs/superpowers/specs/2026-10-02-bytegit-design.md`。
 
 mod change;
+mod content;
 mod error;
 mod id;
 mod info;
@@ -13,6 +14,7 @@ mod status;
 pub mod testutil;
 
 pub use change::ChangeKind;
+pub use content::{Content, ContentLimits, ContentPair};
 pub use error::{GitError, GitErrorKind};
 pub use id::{BlobId, CommitId};
 pub use info::{HeadInfo, Remote};

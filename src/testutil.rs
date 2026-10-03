@@ -84,10 +84,23 @@ impl TempRepo {
 
     /// 写文件、暂存并提交到当前分支。
     pub fn commit_file(&self, rel: &str, content: &str, message: &str) -> CommitId {
-        self.write_untracked(rel, content);
+        self.commit_bytes(rel, content.as_bytes(), message)
+    }
+
+    /// 同 [`TempRepo::commit_file`],内容是任意字节(二进制、非 UTF-8)。
+    pub fn commit_bytes(&self, rel: &str, content: &[u8], message: &str) -> CommitId {
+        let full = self.path().join(rel);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).expect("创建目录失败");
+        }
+        std::fs::write(full, content).expect("写文件失败");
+        self.stage(rel);
+        self.commit_staged(message)
+    }
+
+    /// 把当前暂存区原样提交到当前分支(配合 `stage`/`stage_remove` 做一次含多个改动的提交)。
+    pub fn commit_staged(&self, message: &str) -> CommitId {
         let mut index = self.repo.index().expect("读取 index 失败");
-        index.add_path(Path::new(rel)).expect("暂存失败");
-        index.write().expect("写 index 失败");
         let tree = self
             .repo
             .find_tree(index.write_tree().expect("写 tree 失败"))
@@ -103,6 +116,42 @@ impl TempRepo {
             .commit(Some("HEAD"), &sig, &sig, message, &tree, &parent_refs)
             .expect("提交失败");
         self.commits.set(self.commits.get() + 1);
+        CommitId::from_oid(oid)
+    }
+
+    /// 把分支 `other` 合并进当前分支,生成一个两父提交(两边改的文件不能冲突)。
+    pub fn merge_commit(&self, other: &str, message: &str) -> CommitId {
+        let ours = self
+            .repo
+            .head()
+            .expect("合并前需要至少一次提交")
+            .peel_to_commit()
+            .expect("HEAD 不是提交");
+        let theirs = self
+            .repo
+            .find_branch(other, git2::BranchType::Local)
+            .expect("找不到分支")
+            .get()
+            .peel_to_commit()
+            .expect("分支不是提交");
+        let mut merged = self
+            .repo
+            .merge_commits(&ours, &theirs, None)
+            .expect("合并失败");
+        assert!(!merged.has_conflicts(), "merge_commit 只用于无冲突合并");
+        let tree = self
+            .repo
+            .find_tree(merged.write_tree_to(&self.repo).expect("写 tree 失败"))
+            .expect("找不到 tree");
+        let sig = self.signature();
+        let oid = self
+            .repo
+            .commit(Some("HEAD"), &sig, &sig, message, &tree, &[&ours, &theirs])
+            .expect("提交失败");
+        self.commits.set(self.commits.get() + 1);
+        self.repo
+            .checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .expect("检出失败");
         CommitId::from_oid(oid)
     }
 
