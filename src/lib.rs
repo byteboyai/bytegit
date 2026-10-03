@@ -8,6 +8,7 @@ mod error;
 mod id;
 mod info;
 mod repo;
+mod status;
 #[cfg(any(test, feature = "testutil"))]
 pub mod testutil;
 
@@ -16,3 +17,4 @@ pub use error::{GitError, GitErrorKind};
 pub use id::{BlobId, CommitId};
 pub use info::{HeadInfo, Remote};
 pub use repo::Repo;
+pub use status::{FileState, StatusEntry, StatusOptions};
