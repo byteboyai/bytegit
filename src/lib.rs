@@ -14,6 +14,8 @@ mod stats;
 mod status;
 #[cfg(any(test, feature = "testutil"))]
 pub mod testutil;
+#[cfg(feature = "watch")]
+mod watch;
 
 pub use change::ChangeKind;
 pub use content::{Content, ContentLimits, ContentPair};
@@ -23,3 +25,5 @@ pub use id::{BlobId, CommitId};
 pub use info::{HeadInfo, Remote};
 pub use repo::Repo;
 pub use status::{FileState, StatusEntry, StatusOptions};
+#[cfg(feature = "watch")]
+pub use watch::{GitChange, IgnoreRules, WatchHandle, WatchOptions, watch};

@@ -60,6 +60,13 @@ impl From<git2::Error> for GitError {
     }
 }
 
+#[cfg(feature = "watch")]
+impl From<notify::Error> for GitError {
+    fn from(e: notify::Error) -> Self {
+        Self::new(GitErrorKind::Io, e.to_string())
+    }
+}
+
 impl From<std::io::Error> for GitError {
     fn from(e: std::io::Error) -> Self {
         Self::new(GitErrorKind::Io, e.to_string())
