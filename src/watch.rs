@@ -146,7 +146,11 @@ fn classify(root: &Path, changed: &Path, ignore: &IgnoreRules) -> Option<Kind> {
     let rel = changed.strip_prefix(root).ok()?;
     let mut parts = rel.components();
     let Some(Component::Normal(first)) = parts.next() else {
-        return Some(Kind::Workdir); // 仓库根自身的事件,极少见,当作相关
+        // 事件路径就是监听根本身(FSEvents 建流时会先对根报一条 Create(Folder)/Modify(Metadata);
+        // 目录自身的 mtime 变化也会落到这里)。这种目录级事件不携带文件名信息:若当成相关,
+        // 往里写 `target/`、`node_modules/` 也会连带触发刷新,忽略规则形同虚设。
+        // 真正的内容改动会各自报成具体文件路径,不依赖这条。
+        return None;
     };
     let first = first.to_string_lossy();
     if first == ".git" {
@@ -305,8 +309,10 @@ mod tests {
     // ---- classify:迁移前就有、此前没有测试的口径 ----
 
     #[test]
-    fn the_repo_root_itself_is_relevant_as_workdir() {
-        assert_eq!(kind("/r"), Some(Kind::Workdir));
+    fn the_repo_root_itself_is_not_relevant() {
+        // FSEvents 建流时会对根报一条 Create(Folder)/Modify(Metadata);目录自身的 mtime 变化
+        // 也落到根路径。这类目录级事件不带文件信息,不能当成"工作区改了"——否则忽略规则失效。
+        assert_eq!(kind("/r"), None);
     }
 
     #[test]
