@@ -80,11 +80,20 @@ impl Repo {
     /// 失败时 `message()` 是 git 的 stderr 原文(含受影响的文件与处理建议),可直接展示。
     ///
     /// 从仓库工作区根运行,所以 `Repo` 是从子目录打开的也切整个仓库。
+    ///
+    /// `name` 以 `-` 开头会被 git 当成选项,直接拒绝;末尾的 `--` 让 git 只把 `name` 当引用,
+    /// 不会在分支名与同名文件并存时报歧义。
     pub fn checkout_branch(&self, name: &str) -> Result<(), GitError> {
+        if name.starts_with('-') {
+            return Err(GitError::new(
+                GitErrorKind::Backend,
+                format!("无效的分支名: {name}"),
+            ));
+        }
         run_git(
             "git",
             Some(self.root()),
-            &[OsStr::new("checkout"), OsStr::new(name)],
+            &[OsStr::new("checkout"), OsStr::new(name), OsStr::new("--")],
         )
     }
 }
@@ -94,6 +103,9 @@ impl Repo {
 fn run_git(program: &str, cwd: Option<&Path>, args: &[&OsStr]) -> Result<(), GitError> {
     let mut cmd = Command::new(program);
     cmd.args(args);
+    // 不允许 git 在终端上询问凭据:从终端启动的 GUI 否则会一直等一个看不见的输入。
+    // 凭据助手 / SSH agent 照常工作,拿不到凭据就直接失败并带 stderr。
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
@@ -337,6 +349,23 @@ mod tests {
         assert!(err.message().contains("c.txt"), "{}", err.message());
         assert_eq!(head_branch(&t).as_deref(), Some("main"));
         assert_eq!(read(&t, "c.txt"), "mine\n");
+    }
+
+    #[test]
+    fn a_dash_prefixed_branch_name_is_rejected_not_taken_as_an_option() {
+        let t = two_branches();
+        let err = t.open().checkout_branch("--detach").unwrap_err();
+        assert_eq!(err.kind(), GitErrorKind::Backend);
+        assert!(err.message().contains("--detach"), "{}", err.message());
+        assert_eq!(head_branch(&t).as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn a_branch_with_the_same_name_as_a_file_checks_out_the_branch() {
+        let t = two_branches();
+        t.branch("b.txt");
+        t.open().checkout_branch("b.txt").unwrap();
+        assert_eq!(head_branch(&t).as_deref(), Some("b.txt"));
     }
 
     #[test]

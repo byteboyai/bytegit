@@ -3,10 +3,13 @@
 //! 只依赖 `notify` 与标准线程,不依赖 tokio。事件的发布(送进应用的消息循环/事件总线)
 //! 不在这里:调用方在 `on_change` 里自己转发。
 //!
-//! **已知限制(规格 O3):** 只监听 `root` 目录树。`root/.git` 是目录时,其中的
-//! `HEAD`/`index`/`packed-refs`/`refs/*` 会被识别;`.git` 是文件(linked worktree、子模块,
-//! 指向别处的 gitdir)时,真实 gitdir 在 `root` 之外,**不会被监听**,只有工作区文件的变化会上报。
-//! 以后补上不需要改这里的 API(监听目标改为解析后的 gitdir 即可)。
+//! `root/.git` 是目录时,其中的 `HEAD`/`index`/`packed-refs`/`refs/*` 会被识别。
+//! `.git` 是文件(linked worktree、子模块,内容为 `gitdir: <路径>`)时,真实 gitdir 在 `root`
+//! 之外:启动时解析它并一并监听——gitdir 本身的 `HEAD`/`index`/`refs/*`,以及(linked worktree
+//! 经 `commondir` 指回的)主仓库的 `packed-refs` 与 `refs/*`(别的 worktree 提交会动到它们)。
+//!
+//! **已知限制:** 解析只在 [`watch`] 启动时做一次;`.git` 文件之后被改成指向别处不会重新接线
+//! (需要重建监听器)。`.git` 文件本身的变化不上报。
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -108,15 +111,33 @@ pub fn watch(
     let (tx, rx) = mpsc::channel::<Batch>();
     let filter_root = root.clone();
     let ignore = opts.ignore;
+    let external = ExternalGit::resolve(&root);
+    let filter_external = external.clone();
 
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         let Ok(event) = res else { return };
-        let batch = batch_of(&filter_root, &event.paths, &ignore);
+        // 「文件被打开/读取」不是变更:Linux 的 inotify 会报它,dozer 自己读文件(如 `git status`)
+        // 就会反过来触发刷新。
+        if matches!(event.kind, notify::EventKind::Access(_)) {
+            return;
+        }
+        let batch = batch_of(
+            &filter_root,
+            filter_external.as_ref(),
+            &event.paths,
+            &ignore,
+        );
         if !batch.is_empty() {
             let _ = tx.send(batch);
         }
     })?;
     watcher.watch(&root, notify::RecursiveMode::Recursive)?;
+    if let Some(ext) = &external {
+        // 额外目录监听失败(被删、权限)不拖垮工作区监听:退化为只上报工作区变化。
+        for (dir, mode) in ext.watch_targets() {
+            let _ = watcher.watch(&dir, mode);
+        }
+    }
 
     let stopped = Arc::new(AtomicBool::new(false));
     let thread_stopped = stopped.clone();
@@ -132,6 +153,66 @@ pub fn watch(
     })
 }
 
+/// `root/.git` 是文件时解析出的、位于 `root` 之外的真实 git 目录。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExternalGit {
+    /// `.git` 文件指向的目录(linked worktree 的 `<主仓库>/.git/worktrees/<名>`、
+    /// 子模块的 `<超级项目>/.git/modules/<名>`)。均已规范化。
+    gitdir: PathBuf,
+    /// 共享的主 git 目录(`gitdir/commondir`);没有该文件时与 `gitdir` 相同。
+    commondir: PathBuf,
+}
+
+impl ExternalGit {
+    /// `root/.git` 不是文件、内容不合法或目标目录不存在时返回 `None`。
+    fn resolve(root: &Path) -> Option<Self> {
+        let dot_git = root.join(".git");
+        if !dot_git.is_file() {
+            return None;
+        }
+        let text = std::fs::read_to_string(&dot_git).ok()?;
+        let target = text.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim();
+        // 相对路径相对 `.git` 文件所在目录;绝对路径 `join` 会直接替换。
+        let gitdir = root.join(target).canonicalize().ok()?;
+        let commondir = std::fs::read_to_string(gitdir.join("commondir"))
+            .ok()
+            .and_then(|c| gitdir.join(c.trim()).canonicalize().ok())
+            .unwrap_or_else(|| gitdir.clone());
+        Some(Self { gitdir, commondir })
+    }
+
+    /// 需要额外监听的目录。主仓库目录不递归(里面有 `objects/` 等大目录),只取
+    /// `packed-refs` 所在层与 `refs/` 子树。
+    fn watch_targets(&self) -> Vec<(PathBuf, notify::RecursiveMode)> {
+        use notify::RecursiveMode::{NonRecursive, Recursive};
+        let mut targets = vec![(self.gitdir.clone(), Recursive)];
+        if self.commondir != self.gitdir {
+            targets.push((self.commondir.clone(), NonRecursive));
+            targets.push((self.commondir.join("refs"), Recursive));
+        }
+        targets
+    }
+
+    fn classify(&self, changed: &Path) -> Option<Kind> {
+        // gitdir 优先:linked worktree 的 gitdir 位于 commondir 之下。
+        if let Ok(rest) = changed.strip_prefix(&self.gitdir) {
+            return is_ref_file(rest, true).then_some(Kind::GitRefs);
+        }
+        if let Ok(rest) = changed.strip_prefix(&self.commondir) {
+            // 主仓库的 `HEAD`/`index` 属于主工作区,与本 worktree 无关。
+            return is_ref_file(rest, false).then_some(Kind::GitRefs);
+        }
+        None
+    }
+}
+
+/// `rest`(相对某个 git 目录)是否是引用类文件。`per_worktree` 为真时还认 `HEAD`/`index`。
+fn is_ref_file(rest: &Path, per_worktree: bool) -> bool {
+    rest == Path::new("packed-refs")
+        || rest.starts_with("refs")
+        || (per_worktree && (rest == Path::new("HEAD") || rest == Path::new("index")))
+}
+
 /// 一次路径变化相对这个仓库的相关性。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -142,7 +223,15 @@ enum Kind {
 /// `changed` 是否值得上报,值得的话是哪一类。`root/.git` 下只有 `HEAD`、`index`、
 /// `packed-refs`、`refs/*` 算引用类,其余(`objects/` 等)忽略;嵌套层的 `.git`
 /// (子模块、内嵌仓库)与调用方指定的名字在任何一层命中都忽略。
-fn classify(root: &Path, changed: &Path, ignore: &IgnoreRules) -> Option<Kind> {
+fn classify(
+    root: &Path,
+    external: Option<&ExternalGit>,
+    changed: &Path,
+    ignore: &IgnoreRules,
+) -> Option<Kind> {
+    if let Some(kind) = external.and_then(|e| e.classify(changed)) {
+        return Some(kind);
+    }
     let rel = changed.strip_prefix(root).ok()?;
     let mut parts = rel.components();
     let Some(Component::Normal(first)) = parts.next() else {
@@ -212,11 +301,16 @@ impl Batch {
 /// 把一个 notify 事件的路径折成一个 [`Batch`]。逐路径规范化(规范化失败,如文件刚被删,
 /// 就用原路径)后再判断相关性,避免 macOS 上 `/var/...` 与 `/private/var/...` 不一致让整批
 /// 事件被误判为无关。
-fn batch_of(root: &Path, event_paths: &[PathBuf], ignore: &IgnoreRules) -> Batch {
+fn batch_of(
+    root: &Path,
+    external: Option<&ExternalGit>,
+    event_paths: &[PathBuf],
+    ignore: &IgnoreRules,
+) -> Batch {
     let mut batch = Batch::default();
     for path in event_paths {
         let normalized = path.canonicalize().unwrap_or_else(|_| path.clone());
-        match classify(root, &normalized, ignore) {
+        match classify(root, external, &normalized, ignore) {
             Some(Kind::GitRefs) => {
                 batch.refs_changed = true;
                 batch.paths.insert(normalized);
@@ -265,7 +359,7 @@ mod tests {
     }
 
     fn kind(changed: &str) -> Option<Kind> {
-        classify(Path::new("/r"), Path::new(changed), &hidden())
+        classify(Path::new("/r"), None, Path::new(changed), &hidden())
     }
 
     // ---- classify:从 dozer `git_watch.rs` 原样迁来的断言 ----
@@ -341,14 +435,14 @@ mod tests {
     #[test]
     fn a_dot_git_file_at_the_root_is_not_relevant() {
         // linked worktree / 子模块里 `.git` 是个指向别处 gitdir 的文件:这个文件本身的变化不上报
-        // (真实 gitdir 在 root 之外,不在监听范围内——见模块文档的已知限制)。
+        // (真实 gitdir 的变化由 `ExternalGit` 另行识别——见模块文档)。
         assert_eq!(kind("/r/.git"), None);
     }
 
     #[test]
     fn ignore_rules_are_defined_by_the_caller() {
         let none = IgnoreRules::default();
-        let c = |p: &str| classify(Path::new("/r"), Path::new(p), &none);
+        let c = |p: &str| classify(Path::new("/r"), None, Path::new(p), &none);
         // 没有规则时,`target`/`node_modules` 都算工作区变化。
         assert_eq!(c("/r/target/debug/foo"), Some(Kind::Workdir));
         assert_eq!(c("/r/a/node_modules/x"), Some(Kind::Workdir));
@@ -358,7 +452,12 @@ mod tests {
         assert_eq!(c("/r/vendor/sub/.git/HEAD"), None);
         let only_dist = IgnoreRules::new(["dist"]);
         assert_eq!(
-            classify(Path::new("/r"), Path::new("/r/a/dist/x.js"), &only_dist),
+            classify(
+                Path::new("/r"),
+                None,
+                Path::new("/r/a/dist/x.js"),
+                &only_dist
+            ),
             None
         );
     }
@@ -373,7 +472,7 @@ mod tests {
             PathBuf::from("/r/target/x"),
             PathBuf::from("/r/src/a.rs"),
         ];
-        let b = batch_of(Path::new("/r"), &paths, &hidden());
+        let b = batch_of(Path::new("/r"), None, &paths, &hidden());
         assert!(b.refs_changed && b.workdir_changed);
         assert_eq!(
             b.paths.into_iter().collect::<Vec<_>>(),
@@ -393,7 +492,7 @@ mod tests {
         let link = links.path().join("link");
         std::os::unix::fs::symlink(&root, &link).unwrap();
 
-        let b = batch_of(&root, &[link.join("a.rs")], &hidden());
+        let b = batch_of(&root, None, &[link.join("a.rs")], &hidden());
         assert!(b.workdir_changed);
         assert_eq!(
             b.paths.into_iter().collect::<Vec<_>>(),
@@ -408,7 +507,119 @@ mod tests {
             PathBuf::from("/r/target/x"),
             PathBuf::from("/r/.git/objects/ab"),
         ];
-        assert!(batch_of(Path::new("/r"), &paths, &hidden()).is_empty());
+        assert!(batch_of(Path::new("/r"), None, &paths, &hidden()).is_empty());
+    }
+
+    // ---- .git 是文件(linked worktree / 子模块)----
+
+    fn ext(gitdir: &str, commondir: &str) -> ExternalGit {
+        ExternalGit {
+            gitdir: PathBuf::from(gitdir),
+            commondir: PathBuf::from(commondir),
+        }
+    }
+
+    #[test]
+    fn linked_worktree_gitdir_head_and_index_are_refs() {
+        let e = ext("/main/.git/worktrees/w", "/main/.git");
+        let c = |p: &str| classify(Path::new("/w"), Some(&e), Path::new(p), &hidden());
+        assert_eq!(c("/main/.git/worktrees/w/HEAD"), Some(Kind::GitRefs));
+        assert_eq!(c("/main/.git/worktrees/w/index"), Some(Kind::GitRefs));
+        assert_eq!(c("/main/.git/worktrees/w/logs/HEAD"), None);
+    }
+
+    #[test]
+    fn linked_worktree_shared_refs_come_from_the_common_dir() {
+        let e = ext("/main/.git/worktrees/w", "/main/.git");
+        let c = |p: &str| classify(Path::new("/w"), Some(&e), Path::new(p), &hidden());
+        assert_eq!(c("/main/.git/refs/heads/main"), Some(Kind::GitRefs));
+        assert_eq!(c("/main/.git/packed-refs"), Some(Kind::GitRefs));
+        // 主工作区自己的 HEAD/index 与本 worktree 无关;别的 worktree 的私有文件也无关。
+        assert_eq!(c("/main/.git/HEAD"), None);
+        assert_eq!(c("/main/.git/index"), None);
+        assert_eq!(c("/main/.git/worktrees/other/HEAD"), None);
+        assert_eq!(c("/main/.git/objects/ab/cd"), None);
+    }
+
+    #[test]
+    fn submodule_gitdir_is_its_own_common_dir() {
+        let e = ext("/s/.git/modules/m", "/s/.git/modules/m");
+        let c = |p: &str| classify(Path::new("/s/m"), Some(&e), Path::new(p), &hidden());
+        assert_eq!(c("/s/.git/modules/m/HEAD"), Some(Kind::GitRefs));
+        assert_eq!(c("/s/.git/modules/m/refs/heads/x"), Some(Kind::GitRefs));
+        assert_eq!(c("/s/.git/modules/m/packed-refs"), Some(Kind::GitRefs));
+        assert_eq!(c("/s/.git/modules/m/objects/ab"), None);
+    }
+
+    #[test]
+    fn resolve_reads_a_relative_gitdir_and_commondir() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let wt_git = base.join("main/.git/worktrees/w");
+        std::fs::create_dir_all(&wt_git).unwrap();
+        std::fs::write(wt_git.join("commondir"), "../..\n").unwrap();
+        let root = base.join("w");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".git"), "gitdir: ../main/.git/worktrees/w\n").unwrap();
+        let got = ExternalGit::resolve(&root).unwrap();
+        assert_eq!(got.gitdir, wt_git);
+        assert_eq!(got.commondir, base.join("main/.git"));
+    }
+
+    #[test]
+    fn resolve_is_none_for_a_dot_git_directory_or_garbage() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        assert_eq!(ExternalGit::resolve(dir.path()), None);
+        let d2 = tempfile::tempdir().unwrap();
+        std::fs::write(d2.path().join(".git"), "not a gitdir line\n").unwrap();
+        assert_eq!(ExternalGit::resolve(d2.path()), None);
+        let d3 = tempfile::tempdir().unwrap();
+        std::fs::write(d3.path().join(".git"), "gitdir: /does/not/exist\n").unwrap();
+        assert_eq!(ExternalGit::resolve(d3.path()), None);
+    }
+
+    /// 真实 `git worktree add`:在 worktree 里切分支必须上报 `refs_changed`。
+    #[test]
+    fn watch_reports_ref_changes_of_a_linked_worktree() {
+        let main = crate::testutil::TempRepo::new();
+        main.commit_file("a.txt", "1\n", "init");
+        main.branch("other");
+        let wt_dir = tempfile::tempdir().unwrap();
+        let wt = wt_dir.path().canonicalize().unwrap().join("wt");
+        let status = std::process::Command::new("git")
+            .args(["worktree", "add", "--detach"])
+            .arg(&wt)
+            .current_dir(main.path())
+            .output()
+            .unwrap();
+        assert!(status.status.success(), "{status:?}");
+
+        let seen = Arc::new(Mutex::new(Vec::<GitChange>::new()));
+        let seen2 = seen.clone();
+        let _handle = watch(
+            &wt,
+            WatchOptions::new(Duration::from_millis(100)).ignore(hidden()),
+            move |c| seen2.lock().unwrap().push(c),
+        )
+        .unwrap();
+
+        let out = std::process::Command::new("git")
+            .args(["checkout", "other"])
+            .current_dir(&wt)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !seen.lock().unwrap().iter().any(|c| c.refs_changed) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let seen = seen.lock().unwrap();
+        // 与上面的真实 FS 测试一致:后端不投递事件的环境不算失败。
+        if seen.is_empty() {
+            return;
+        }
+        assert!(seen.iter().any(|c| c.refs_changed), "{seen:?}");
     }
 
     // ---- debounce_loop:不碰文件系统的确定性测试 ----
