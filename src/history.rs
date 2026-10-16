@@ -11,8 +11,8 @@ use crate::{BlobId, ChangeKind, CommitId, GitError, GitErrorKind, Repo};
 #[non_exhaustive]
 pub struct LogOptions {
     pub max_count: usize,
-    /// 只列出改动过这个路径的提交。按 git pathspec 解释(与 `git log -- <path>` 相同:
-    /// `*`、`[` 等有通配含义;没有 `--follow` 的重命名跟踪)。
+    /// 只列出改动过这个路径的提交。按**字面路径**匹配(`*`、`[` 等不是通配符;目录前缀仍
+    /// 匹配其下的文件);没有 `--follow` 的重命名跟踪。
     pub path: Option<PathBuf>,
 }
 
@@ -126,7 +126,7 @@ impl Repo {
                     Err(_) => None,
                 };
                 let mut diff_opts = git2::DiffOptions::new();
-                diff_opts.pathspec(spec);
+                diff_opts.pathspec(spec).disable_pathspec_match(true);
                 let diff = repo.diff_tree_to_tree(
                     old_tree.as_ref(),
                     Some(&new_tree),
@@ -211,7 +211,8 @@ impl Repo {
         let commit = repo.find_commit(commit.oid())?;
         let tree = commit.tree()?;
         let mut opts = git2::DiffOptions::new();
-        opts.pathspec(path.to_string_lossy().into_owned());
+        opts.pathspec(path.to_string_lossy().into_owned())
+            .disable_pathspec_match(true);
         let diff = repo.diff_tree_to_workdir(Some(&tree), Some(&mut opts))?;
 
         let mut text = String::new();
@@ -316,14 +317,14 @@ mod tests {
         assert_eq!(ids(&log), vec![c1]);
     }
 
-    /// 已知怪癖(从迁移前的 `file_history::build` 原样带过来):`path` 按 pathspec 解释,
-    /// 文件名里的 `[`、`*` 是通配符,所以 `a[1].txt` 的历史里会混进 `a1.txt` 的提交。
-    /// 要改成字面匹配是单独的行为变更(见 P2 计划"待决事项" D3),改的时候同时改这条测试。
+    /// 文件名里的 `[`、`*` 是字面字符(O11 已修):`a[1].txt` 的历史不再混进 `a1.txt` 的提交。
     #[test]
-    fn log_path_is_a_pathspec_so_glob_characters_match_other_files_known_quirk() {
+    fn log_path_is_literal_so_glob_characters_do_not_match_other_files() {
         let t = TempRepo::new();
         t.commit_file("a[1].txt", "x\n", "literal bracket");
         t.commit_file("a1.txt", "x\n", "a1");
+        t.commit_file("star*.txt", "x\n", "literal star");
+        t.commit_file("starry.txt", "x\n", "starry");
         let summaries = |p: &str| -> Vec<String> {
             t.open()
                 .log(LogOptions::new(10).path(p))
@@ -333,7 +334,19 @@ mod tests {
                 .collect()
         };
         assert_eq!(summaries("a1.txt"), vec!["a1"]);
-        assert_eq!(summaries("a[1].txt"), vec!["a1", "literal bracket"]);
+        assert_eq!(summaries("a[1].txt"), vec!["literal bracket"]);
+        assert_eq!(summaries("star*.txt"), vec!["literal star"]);
+        assert_eq!(summaries("*.txt"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn log_path_naming_a_directory_still_matches_files_under_it() {
+        let t = TempRepo::new();
+        t.commit_file("src/a.rs", "x\n", "in src");
+        t.commit_file("other.rs", "x\n", "elsewhere");
+        let got = t.open().log(LogOptions::new(10).path("src")).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].summary, "in src");
     }
 
     #[test]
@@ -502,6 +515,21 @@ mod tests {
         assert!(p.text.contains("-one\n"), "{}", p.text);
         assert!(p.text.contains("+two\n"), "{}", p.text);
         assert!(!p.truncated);
+    }
+
+    #[test]
+    fn workdir_patch_path_is_literal_not_a_glob() {
+        let t = TempRepo::new();
+        let c = t.commit_file("a[1].txt", "one\n", "bracket");
+        t.commit_file("a1.txt", "one\n", "plain");
+        t.write_untracked("a[1].txt", "two\n");
+        t.write_untracked("a1.txt", "changed\n");
+        let p = t
+            .open()
+            .workdir_patch(c, Path::new("a[1].txt"), 20_000)
+            .unwrap();
+        assert!(p.text.contains("+two\n"), "{}", p.text);
+        assert!(!p.text.contains("changed"), "{}", p.text);
     }
 
     #[test]
