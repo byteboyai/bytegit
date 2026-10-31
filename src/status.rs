@@ -44,6 +44,19 @@ pub struct StatusEntry {
     pub state: FileState,
 }
 
+/// 一次状态收集的完整结果:条目(用于树/装饰)与"是否有真实改动"(用于 dirty)。
+///
+/// `entries` 与 [`Repo::status`] 在相同选项下的输出一致;`dirty` 与旧
+/// [`Repo::is_dirty`] 不同——它排除**纯 ignored** 条目。`include_ignored=true` 时
+/// 快照既要给树提供 ignored 装饰,又不该把被忽略的构建产物算成 dirty。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusSnapshot {
+    pub entries: Vec<StatusEntry>,
+    /// 所请求范围内是否有真实改动:排除纯 ignored,包含冲突、非 UTF-8 路径与其它
+    /// 后端非空改动标志。不能从 `entries` 是否非空推导(非 UTF-8 条目会被跳过)。
+    pub dirty: bool,
+}
+
 fn index_kind(s: git2::Status) -> Option<ChangeKind> {
     use git2::Status as S;
     if s.contains(S::INDEX_NEW) {
@@ -108,37 +121,67 @@ fn git2_options(opts: StatusOptions) -> git2::StatusOptions {
 }
 
 impl Repo {
+    /// 后端 `statuses` 收集的唯一入口。所有公开状态查询都经过它,便于测试计数。
+    fn collect_statuses(&self, opts: StatusOptions) -> Result<git2::Statuses<'_>, GitError> {
+        #[cfg(test)]
+        self.status_collections
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut o = git2_options(opts);
+        Ok(self.raw().statuses(Some(&mut o))?)
+    }
+
     /// 有改动的路径及其状态。路径不是合法 UTF-8 的条目被跳过。bare 仓库返回错误。
     pub fn status(&self, opts: StatusOptions) -> Result<Vec<StatusEntry>, GitError> {
-        let mut o = git2_options(opts);
-        let statuses = self.raw().statuses(Some(&mut o))?;
-        let mut out = Vec::new();
-        for entry in statuses.iter() {
-            let s = entry.status();
-            if s.is_empty() {
-                continue;
-            }
-            let Some(path) = entry_path(&entry, s) else {
-                continue;
-            };
-            out.push(StatusEntry {
-                path,
-                state: FileState {
-                    index: index_kind(s),
-                    worktree: worktree_kind(s),
-                    ignored: s.contains(git2::Status::IGNORED),
-                    conflicted: s.contains(git2::Status::CONFLICTED),
-                },
-            });
-        }
-        Ok(out)
+        let statuses = self.collect_statuses(opts)?;
+        Ok(entries_from_statuses(&statuses))
+    }
+
+    /// 一次后端收集同时得到条目与 dirty。组合刷新应使用它,避免为 dirty 再扫一遍。
+    ///
+    /// `dirty` 排除纯 ignored;旧 [`Repo::is_dirty`] 的参数行为保持不变(见其文档)。
+    pub fn status_snapshot(&self, opts: StatusOptions) -> Result<StatusSnapshot, GitError> {
+        let statuses = self.collect_statuses(opts)?;
+        let entries = entries_from_statuses(&statuses);
+        let dirty = statuses.iter().any(|entry| is_dirty_flags(entry.status()));
+        Ok(StatusSnapshot { entries, dirty })
     }
 
     /// 是否有任何改动。与 `status(opts)` 是否非空一致,但不会因为路径不是 UTF-8 而漏报。
+    ///
+    /// **注意**:`include_ignored=true` 时,只要存在被忽略的条目,它就和以前一样返回
+    /// `true`;"排除纯 ignored"的口径属于 [`Repo::status_snapshot`] 的 `dirty`,不要
+    /// 悄悄改掉这里的旧行为。
     pub fn is_dirty(&self, opts: StatusOptions) -> Result<bool, GitError> {
-        let mut o = git2_options(opts);
-        Ok(!self.raw().statuses(Some(&mut o))?.is_empty())
+        Ok(!self.collect_statuses(opts)?.is_empty())
     }
+}
+
+fn entries_from_statuses(statuses: &git2::Statuses<'_>) -> Vec<StatusEntry> {
+    let mut out = Vec::new();
+    for entry in statuses.iter() {
+        let s = entry.status();
+        if s.is_empty() {
+            continue;
+        }
+        let Some(path) = entry_path(&entry, s) else {
+            continue;
+        };
+        out.push(StatusEntry {
+            path,
+            state: FileState {
+                index: index_kind(s),
+                worktree: worktree_kind(s),
+                ignored: s.contains(git2::Status::IGNORED),
+                conflicted: s.contains(git2::Status::CONFLICTED),
+            },
+        });
+    }
+    out
+}
+
+/// 纯 ignored 不算改动;任何其它位(含冲突、未读、类型变化)都算。
+fn is_dirty_flags(s: git2::Status) -> bool {
+    s.bits() & !git2::Status::IGNORED.bits() != 0
 }
 
 #[cfg(test)]
@@ -329,6 +372,199 @@ mod tests {
         git2::Repository::init_bare(dir.path()).unwrap();
         let repo = crate::Repo::discover(dir.path()).unwrap();
         assert!(repo.status(StatusOptions::default()).is_err());
+        assert!(repo.status_snapshot(StatusOptions::default()).is_err());
         assert!(repo.is_dirty(StatusOptions::default()).is_err());
+    }
+
+    // ---- status_snapshot:一次收集 + dirty 口径 ----
+
+    #[test]
+    fn a_clean_repo_has_an_empty_snapshot_and_is_not_dirty() {
+        let t = TempRepo::new();
+        t.commit_file("a.txt", "one\n", "c1");
+        let snap = t.open().status_snapshot(StatusOptions::default()).unwrap();
+        assert!(snap.entries.is_empty());
+        assert!(!snap.dirty);
+    }
+
+    #[test]
+    fn snapshot_entries_match_status_for_the_same_options() {
+        let t = TempRepo::new();
+        t.commit_file("a.txt", "one\n", "c1");
+        t.write_untracked("a.txt", "two\n");
+        t.write_untracked("new.txt", "n");
+        let repo = t.open();
+        for opts in [StatusOptions::default(), all()] {
+            assert_eq!(
+                repo.status_snapshot(opts).unwrap().entries,
+                repo.status(opts).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_dirty_is_true_for_untracked_and_tracked_changes() {
+        let t = TempRepo::new();
+        t.commit_file("a.txt", "one\n", "c1");
+        t.commit_file("b.txt", "one\n", "c2");
+        let repo = t.open();
+        assert!(
+            !repo
+                .status_snapshot(StatusOptions::default())
+                .unwrap()
+                .dirty
+        );
+
+        t.write_untracked("untracked.txt", "n");
+        assert!(
+            repo.status_snapshot(StatusOptions::default())
+                .unwrap()
+                .dirty
+        );
+
+        t.delete_file("untracked.txt");
+        t.write_untracked("b.txt", "changed\n");
+        assert!(
+            repo.status_snapshot(StatusOptions::default())
+                .unwrap()
+                .dirty
+        );
+    }
+
+    #[test]
+    fn snapshot_dirty_is_true_for_a_partially_staged_file() {
+        let t = TempRepo::new();
+        t.commit_file("a.txt", "one\n", "c1");
+        t.write_untracked("a.txt", "staged\n").stage("a.txt");
+        t.write_untracked("a.txt", "staged then edited\n");
+        let snap = t.open().status_snapshot(StatusOptions::default()).unwrap();
+        let a = entry(&snap.entries, "a.txt").state;
+        assert_eq!(a.index, Some(ChangeKind::Modified));
+        assert_eq!(a.worktree, Some(ChangeKind::Modified));
+        assert!(snap.dirty);
+    }
+
+    #[test]
+    fn ignored_only_is_not_dirty_but_old_is_dirty_keeps_its_behavior() {
+        let t = TempRepo::new();
+        t.commit_file(".gitignore", "*.log\ntarget/\n", "ignore");
+        t.write_untracked("debug.log", "x")
+            .write_untracked("target/out.bin", "x");
+        let repo = t.open();
+
+        let snap = repo.status_snapshot(all()).unwrap();
+        assert!(!snap.entries.is_empty(), "ignored 条目仍要提供给树");
+        assert!(snap.entries.iter().all(|e| e.state.ignored));
+        assert!(!snap.dirty, "纯 ignored 不算真实改动");
+
+        // 旧 API 明确保留旧口径:include_ignored=true 时 ignored 条目算"非空"。
+        assert!(repo.is_dirty(all()).unwrap());
+        assert!(!repo.is_dirty(StatusOptions::default()).unwrap());
+    }
+
+    #[test]
+    fn conflicted_files_are_dirty_in_the_snapshot() {
+        let t = TempRepo::new();
+        t.make_conflict("c.txt");
+        let snap = t.open().status_snapshot(StatusOptions::default()).unwrap();
+        assert!(entry(&snap.entries, "c.txt").state.conflicted);
+        assert!(snap.dirty);
+    }
+
+    #[test]
+    fn a_non_utf8_path_is_dirty_even_though_it_is_skipped_from_entries() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let t = TempRepo::new();
+            t.commit_file("a.txt", "one\n", "c1");
+            let name = std::ffi::OsStr::from_bytes(b"bad-\xff.txt");
+            // macOS 的 APFS/HFS+ 拒绝非 UTF-8 文件名(EILSEQ);这类平台无法构造该夹具,
+            // Linux 等支持字节文件名的平台会真正执行下面的断言。
+            if std::fs::write(t.path().join(name), "x").is_err() {
+                return;
+            }
+
+            let snap = t.open().status_snapshot(StatusOptions::default()).unwrap();
+            assert!(
+                snap.entries.iter().all(|e| e.path != Path::new(name)),
+                "非 UTF-8 路径按既有契约跳过: {:?}",
+                snap.entries
+            );
+            assert!(snap.dirty, "跳过条目不能让 dirty 漏报");
+        }
+    }
+
+    #[test]
+    fn snapshot_respects_rename_detection_options() {
+        let t = TempRepo::new();
+        let body = "line one\nline two\nline three\nline four\nline five\n";
+        t.commit_file("old.txt", body, "c1");
+        t.stage_remove("old.txt");
+        t.write_untracked("new.txt", body).stage("new.txt");
+        let repo = t.open();
+
+        let without = repo.status_snapshot(StatusOptions::default()).unwrap();
+        entry(&without.entries, "old.txt");
+        entry(&without.entries, "new.txt");
+        assert!(without.dirty);
+
+        let with = repo
+            .status_snapshot(StatusOptions {
+                detect_renames: true,
+                ..StatusOptions::default()
+            })
+            .unwrap();
+        assert_eq!(with.entries.len(), 1);
+        assert_eq!(
+            entry(&with.entries, "new.txt").state.index,
+            Some(ChangeKind::Renamed)
+        );
+        assert!(with.dirty);
+    }
+
+    #[test]
+    fn snapshot_collects_status_exactly_once_regardless_of_entry_count() {
+        let t = TempRepo::new();
+        t.commit_file("a.txt", "one\n", "c1");
+        for i in 0..20 {
+            t.write_untracked(&format!("new/{i}.txt"), "x");
+            t.write_untracked(&format!("mod/{i}.txt"), "x");
+            t.stage(&format!("mod/{i}.txt"));
+        }
+        let repo = t.open();
+        let before = repo.status_collections();
+        let snap = repo.status_snapshot(all()).unwrap();
+        assert_eq!(repo.status_collections() - before, 1, "一次快照只收集一次");
+        assert!(snap.entries.len() >= 40);
+        assert!(snap.dirty);
+    }
+
+    #[test]
+    fn status_and_is_dirty_each_collect_once() {
+        let t = TempRepo::new();
+        t.commit_file("a.txt", "one\n", "c1");
+        t.write_untracked("new.txt", "x");
+        let repo = t.open();
+        let before = repo.status_collections();
+        repo.status(StatusOptions::default()).unwrap();
+        assert_eq!(repo.status_collections() - before, 1);
+        let before = repo.status_collections();
+        repo.is_dirty(StatusOptions::default()).unwrap();
+        assert_eq!(repo.status_collections() - before, 1);
+    }
+
+    #[test]
+    fn snapshot_without_untracked_ignores_untracked_files() {
+        let t = TempRepo::new();
+        t.commit_file("a.txt", "one\n", "c1");
+        t.write_untracked("new.txt", "x");
+        let opts = StatusOptions {
+            include_untracked: false,
+            ..StatusOptions::default()
+        };
+        let snap = t.open().status_snapshot(opts).unwrap();
+        assert!(snap.entries.is_empty());
+        assert!(!snap.dirty);
     }
 }

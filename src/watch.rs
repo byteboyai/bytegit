@@ -353,6 +353,20 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::time::Instant;
 
+    #[test]
+    fn legacy_public_types_stay_source_compatible() {
+        // 新 API 之外,旧构造方式与公开字段必须继续能编译(下游尚未迁移的代码)。
+        let opts =
+            WatchOptions::new(Duration::from_millis(10)).ignore(IgnoreRules::new(["target"]));
+        assert_eq!(opts.debounce, Duration::from_millis(10));
+        let change = GitChange {
+            refs_changed: true,
+            workdir_changed: false,
+            paths: vec![PathBuf::from("/r/a")],
+        };
+        assert!(change.refs_changed && !change.workdir_changed);
+    }
+
     /// 与 dozer 的 `project::HIDDEN` 同一份名单。
     fn hidden() -> IgnoreRules {
         IgnoreRules::new([".git", "target", "node_modules", ".DS_Store"])

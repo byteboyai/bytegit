@@ -8,6 +8,9 @@ use crate::{GitError, GitErrorKind};
 pub struct Repo {
     inner: git2::Repository,
     root: PathBuf,
+    /// 测试用:后端 `statuses` 收集次数。用来钉住"组合快照只收集一次"。
+    #[cfg(test)]
+    pub(crate) status_collections: std::sync::atomic::AtomicUsize,
 }
 
 impl Repo {
@@ -31,7 +34,12 @@ impl Repo {
         };
         // libgit2 返回的目录带尾部分隔符,统一去掉。
         let root: PathBuf = dir.components().collect();
-        Ok(Self { inner, root })
+        Ok(Self {
+            inner,
+            root,
+            #[cfg(test)]
+            status_collections: std::sync::atomic::AtomicUsize::new(0),
+        })
     }
 
     /// 只认仓库根:`path` 必须正好是某个仓库的工作区根(bare 仓库为它的 git 目录)才打开,
@@ -100,6 +108,13 @@ impl Repo {
 
     pub(crate) fn raw(&self) -> &git2::Repository {
         &self.inner
+    }
+
+    /// 测试用:这个句柄累计执行了多少次后端 `statuses` 收集。
+    #[cfg(test)]
+    pub(crate) fn status_collections(&self) -> usize {
+        self.status_collections
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
