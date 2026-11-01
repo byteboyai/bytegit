@@ -98,6 +98,293 @@ impl Repo {
     }
 }
 
+/// 可取消写操作的结果。`Cancelled`/`TimedOut` 是可解释结果,不是后端错误。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationOutcome {
+    Completed,
+    Cancelled,
+    TimedOut,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationReport {
+    pub outcome: OperationOutcome,
+    /// 最后一段 stderr(默认最多 256KiB)。
+    pub stderr: String,
+    pub stderr_truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationProgress {
+    StdoutChunk(usize),
+    StderrChunk(usize),
+}
+
+#[derive(Clone)]
+pub struct OperationOptions {
+    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// `None` = 不设总超时(默认)。
+    pub timeout: Option<std::time::Duration>,
+    /// stderr 保留的最后字节数;`0` 使用默认 256KiB。
+    pub stderr_tail_bytes: usize,
+}
+
+impl Default for OperationOptions {
+    fn default() -> Self {
+        Self {
+            cancel: None,
+            timeout: None,
+            stderr_tail_bytes: 256 * 1024,
+        }
+    }
+}
+
+impl std::fmt::Debug for OperationOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OperationOptions")
+            .field("cancel", &self.cancel.is_some())
+            .field("timeout", &self.timeout)
+            .field("stderr_tail_bytes", &self.stderr_tail_bytes)
+            .finish()
+    }
+}
+
+/// 可取消操作的完成值。成功时同时返回 stderr/截断信息(可能有警告)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Operation<T> {
+    Completed { value: T, report: OperationReport },
+    Cancelled(OperationReport),
+    TimedOut(OperationReport),
+}
+
+impl<T> Operation<T> {
+    pub fn outcome(&self) -> OperationOutcome {
+        match self {
+            Self::Completed { .. } => OperationOutcome::Completed,
+            Self::Cancelled(_) => OperationOutcome::Cancelled,
+            Self::TimedOut(_) => OperationOutcome::TimedOut,
+        }
+    }
+}
+
+/// `git clone` 的可取消版本。`progress` 在等待线程上被调用,事件有界丢弃,
+/// 不会阻塞 stdout/stderr 排空。
+pub fn clone_with_options(
+    url: &str,
+    dest: &Path,
+    options: &OperationOptions,
+    progress: Option<&mut dyn FnMut(OperationProgress)>,
+) -> Result<Operation<Repo>, GitError> {
+    let report = run_cancellable(
+        "git",
+        None,
+        &[
+            OsStr::new("clone"),
+            OsStr::new("--"),
+            OsStr::new(url),
+            dest.as_os_str(),
+        ],
+        options,
+        progress,
+    )?;
+    match report.outcome {
+        OperationOutcome::Completed => {
+            let repo = Repo::discover(dest)?;
+            Ok(Operation::Completed {
+                value: repo,
+                report,
+            })
+        }
+        OperationOutcome::Cancelled => Ok(Operation::Cancelled(report)),
+        OperationOutcome::TimedOut => Ok(Operation::TimedOut(report)),
+    }
+}
+
+/// 可取消 `git checkout <name>`;旧 [`Repo::checkout_branch`] 的兼容包装会忽略取消。
+pub fn checkout_branch_with_options(
+    repo: &Repo,
+    name: &str,
+    options: &OperationOptions,
+    progress: Option<&mut dyn FnMut(OperationProgress)>,
+) -> Result<Operation<()>, GitError> {
+    if name.starts_with('-') {
+        return Err(GitError::new(
+            GitErrorKind::Backend,
+            format!("无效的分支名: {name}"),
+        ));
+    }
+    let report = run_cancellable(
+        "git",
+        Some(repo.root()),
+        &[OsStr::new("checkout"), OsStr::new(name), OsStr::new("--")],
+        options,
+        progress,
+    )?;
+    match report.outcome {
+        OperationOutcome::Completed => Ok(Operation::Completed { value: (), report }),
+        OperationOutcome::Cancelled => Ok(Operation::Cancelled(report)),
+        OperationOutcome::TimedOut => Ok(Operation::TimedOut(report)),
+    }
+}
+
+fn run_cancellable(
+    program: &str,
+    cwd: Option<&Path>,
+    args: &[&OsStr],
+    options: &OperationOptions,
+    mut progress: Option<&mut dyn FnMut(OperationProgress)>,
+) -> Result<OperationReport, GitError> {
+    use std::io::Read;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    // 独立进程组:取消时连同 git 派生的子进程一起回收(Windows 用 taskkill /T)。
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn().map_err(spawn_error)?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (event_tx, event_rx) = mpsc::sync_channel::<OperationProgress>(64);
+    let limit = if options.stderr_tail_bytes == 0 {
+        256 * 1024
+    } else {
+        options.stderr_tail_bytes
+    };
+
+    let out_reader = stdout.map(|mut pipe| {
+        let tx = event_tx.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match pipe.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let _ = tx.try_send(OperationProgress::StdoutChunk(n));
+                    }
+                }
+            }
+        })
+    });
+    let err_reader = stderr.map(|mut pipe| {
+        let tx = event_tx.clone();
+        std::thread::spawn(move || {
+            let mut tail: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
+            let mut truncated = false;
+            let mut buf = [0u8; 8192];
+            loop {
+                match pipe.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let _ = tx.try_send(OperationProgress::StderrChunk(n));
+                        for byte in &buf[..n] {
+                            if tail.len() >= limit {
+                                tail.pop_front();
+                                truncated = true;
+                            }
+                            tail.push_back(*byte);
+                        }
+                    }
+                }
+            }
+            (tail.into_iter().collect::<Vec<u8>>(), truncated)
+        })
+    });
+
+    let deadline = options.timeout.map(|timeout| Instant::now() + timeout);
+    let mut outcome = OperationOutcome::Completed;
+    let status = loop {
+        while let Ok(event) = event_rx.try_recv() {
+            if let Some(callback) = progress.as_deref_mut() {
+                callback(event);
+            }
+        }
+        if options
+            .cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            outcome = OperationOutcome::Cancelled;
+            kill_process_tree(&mut child);
+            break child.wait().ok();
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            outcome = OperationOutcome::TimedOut;
+            kill_process_tree(&mut child);
+            break child.wait().ok();
+        }
+        match child.try_wait() {
+            Ok(Some(done)) => break Some(done),
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(error) => return Err(spawn_error(error)),
+        }
+    };
+    while let Ok(event) = event_rx.try_recv() {
+        if let Some(callback) = progress.as_deref_mut() {
+            callback(event);
+        }
+    }
+    let (stderr_bytes, stderr_truncated) = err_reader
+        .map(|handle| handle.join().unwrap_or_default())
+        .unwrap_or_default();
+    if let Some(handle) = out_reader {
+        let _ = handle.join();
+    }
+    let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
+    let report = OperationReport {
+        outcome,
+        stderr: stderr.clone(),
+        stderr_truncated,
+    };
+    if outcome == OperationOutcome::Completed && status.is_some_and(|s| s.success()) {
+        return Ok(report);
+    }
+    if outcome != OperationOutcome::Completed {
+        return Ok(report);
+    }
+    let mut message = stderr;
+    if stderr_truncated {
+        message.push_str("\n… stderr 已截断");
+    }
+    Err(GitError::new(
+        GitErrorKind::Backend,
+        if message.is_empty() {
+            "git 命令失败(无 stderr)".to_string()
+        } else {
+            message
+        },
+    ))
+}
+
+fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Ok(pid) = i32::try_from(child.id()) {
+            // 负 pid = 整个进程组;spawn 时已 process_group(0)。
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .output();
+    }
+    let _ = child.kill();
+}
+
 /// 跑 `program args...`,成功返回 `Ok`;失败带 stderr 原文。`program` 可替换,只为了测试
 /// "找不到 git" 的分支。
 fn run_git(program: &str, cwd: Option<&Path>, args: &[&OsStr]) -> Result<(), GitError> {
@@ -414,5 +701,88 @@ mod tests {
         cfg.set_str("filter.up.clean", "cat").unwrap();
         t.open().checkout_branch("feature").unwrap();
         assert_eq!(read(&t, "a.txt"), "A2\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cancelled_operation_is_reaped_and_reported_as_cancelled() {
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let started = std::time::Instant::now();
+        let report = run_cancellable(
+            "sh",
+            None,
+            &[OsStr::new("-c"), OsStr::new("sleep 30")],
+            &OperationOptions {
+                cancel: Some(cancel),
+                ..OperationOptions::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(report.outcome, OperationOutcome::Cancelled);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_operation_timeout_is_a_typed_result() {
+        let report = run_cancellable(
+            "sh",
+            None,
+            &[OsStr::new("-c"), OsStr::new("sleep 30")],
+            &OperationOptions {
+                timeout: Some(std::time::Duration::from_millis(100)),
+                ..OperationOptions::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(report.outcome, OperationOutcome::TimedOut);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stderr_tail_is_bounded_and_marked_when_truncated() {
+        let err = run_cancellable(
+            "sh",
+            None,
+            &[
+                OsStr::new("-c"),
+                OsStr::new(
+                    "i=0; while [ $i -lt 100 ]; do printf 0123456789 >&2; i=$((i+1)); done; exit 1",
+                ),
+            ],
+            &OperationOptions {
+                stderr_tail_bytes: 16,
+                ..OperationOptions::default()
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(err.message().contains("stderr 已截断"), "{}", err.message());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn progress_is_bounded_and_drained() {
+        let mut events = 0usize;
+        let report = run_cancellable(
+            "sh",
+            None,
+            &[
+                OsStr::new("-c"),
+                OsStr::new("printf hello; printf world >&2"),
+            ],
+            &OperationOptions::default(),
+            Some(&mut |_event| events += 1),
+        )
+        .unwrap();
+        assert_eq!(report.outcome, OperationOutcome::Completed);
+        assert!(events > 0, "至少应收到一个输出事件");
     }
 }

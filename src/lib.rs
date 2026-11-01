@@ -40,4 +40,7 @@ pub use workspace_watch::{
     WatchDegraded, WorkspaceChange, WorkspaceChangeKind, WorkspaceWatchHandle,
     WorkspaceWatchOptions, watch_workspace,
 };
-pub use write::{CloneOptions, clone, git_available, init};
+pub use write::{
+    CloneOptions, Operation, OperationOptions, OperationOutcome, OperationProgress,
+    OperationReport, checkout_branch_with_options, clone, clone_with_options, git_available, init,
+};
