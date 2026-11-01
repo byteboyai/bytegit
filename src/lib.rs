@@ -24,7 +24,9 @@ mod write;
 pub use change::ChangeKind;
 pub use content::{Content, ContentLimits, ContentPair};
 pub use error::{GitError, GitErrorKind};
-pub use history::{CommitSummary, FileChange, LogOptions, Patch, Signature};
+pub use history::{
+    CommitSummary, FileChange, LimitedPatch, LogOptions, Patch, PatchOptions, Signature,
+};
 pub use id::{BlobId, CommitId};
 pub use identity::{RepoIdentity, WorkspaceKey};
 pub use info::{HeadInfo, Remote};

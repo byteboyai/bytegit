@@ -71,6 +71,43 @@ pub struct Patch {
     pub truncated: bool,
 }
 
+/// 严格 patch 的选项。
+#[derive(Clone, Default)]
+pub struct PatchOptions {
+    /// UTF-8 输出字节上限;严格保证 `text.len() <= max_output_bytes`。
+    pub max_output_bytes: usize,
+    /// 输入大小预算(HEAD blob 与磁盘文件任一超过即不生成 patch);0 = 不限。
+    pub max_input_bytes: u64,
+    /// 协作式取消:每行前检查,置位后返回 `cancelled`。
+    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl std::fmt::Debug for PatchOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PatchOptions")
+            .field("max_output_bytes", &self.max_output_bytes)
+            .field("max_input_bytes", &self.max_input_bytes)
+            .field(
+                "cancel",
+                &self
+                    .cancel
+                    .as_ref()
+                    .map(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)),
+            )
+            .finish()
+    }
+}
+
+/// 严格 patch 的结果。`input_limited`/`cancelled` 都是可解释的受限结果,
+/// 不是后端错误。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LimitedPatch {
+    pub text: String,
+    pub truncated: bool,
+    pub input_limited: bool,
+    pub cancelled: bool,
+}
+
 pub(crate) fn system_time(secs: i64) -> SystemTime {
     if secs >= 0 {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs as u64)
@@ -232,6 +269,94 @@ impl Repo {
             true
         })?;
         Ok(Patch { text, truncated })
+    }
+
+    /// 严格版 [`Repo::workdir_patch`]:UTF-8 输出不超过 `max_output_bytes`(超长单行
+    /// 也服从上限)、可选输入预算与协作式取消。旧 API 的"可能略超一行"语义不变。
+    pub fn workdir_patch_limited(
+        &self,
+        commit: CommitId,
+        path: &Path,
+        options: &PatchOptions,
+    ) -> Result<LimitedPatch, GitError> {
+        let repo = self.raw();
+        let commit = repo.find_commit(commit.oid())?;
+        let tree = commit.tree()?;
+
+        if options.max_input_bytes > 0 {
+            let head_size = tree
+                .get_path(path)
+                .ok()
+                .and_then(|entry| entry.to_object(repo).ok())
+                .and_then(|object| object.as_blob().map(|blob| blob.size() as u64));
+            let disk_size = std::fs::metadata(self.root().join(path))
+                .ok()
+                .filter(|meta| meta.is_file())
+                .map(|meta| meta.len());
+            let too_large = head_size.is_some_and(|size| size > options.max_input_bytes)
+                || disk_size.is_some_and(|size| size > options.max_input_bytes);
+            if too_large {
+                return Ok(LimitedPatch {
+                    text: String::new(),
+                    truncated: false,
+                    input_limited: true,
+                    cancelled: false,
+                });
+            }
+        }
+
+        let mut opts = git2::DiffOptions::new();
+        opts.pathspec(path.to_string_lossy().into_owned())
+            .disable_pathspec_match(true);
+        let diff = repo.diff_tree_to_workdir(Some(&tree), Some(&mut opts))?;
+
+        let mut text = String::new();
+        let mut truncated = false;
+        let mut cancelled = false;
+        let printed = diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
+            if options
+                .cancel
+                .as_ref()
+                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+            {
+                cancelled = true;
+                return false;
+            }
+            let mut rendered = String::new();
+            if matches!(line.origin(), '+' | '-' | ' ') {
+                rendered.push(line.origin());
+            }
+            rendered.push_str(&String::from_utf8_lossy(line.content()));
+            if rendered.is_empty() {
+                return true;
+            }
+            let remaining = options.max_output_bytes.saturating_sub(text.len());
+            if rendered.len() <= remaining {
+                text.push_str(&rendered);
+                return true;
+            }
+            // 严格上限:只复制能放下的前缀,并退到 UTF-8 字符边界。
+            let mut cut = remaining.min(rendered.len());
+            while cut > 0 && !rendered.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            text.push_str(&rendered[..cut]);
+            truncated = true;
+            false
+        });
+        // libgit2 把“回调返回 false”报告成 GIT_EUSER;这是我们主动截断/取消的
+        // 成功路径,不是后端错误。
+        if let Err(error) = printed
+            && !(truncated || cancelled)
+        {
+            return Err(error.into());
+        }
+        Ok(LimitedPatch {
+            text,
+            truncated,
+            input_limited: false,
+            cancelled,
+        })
     }
 }
 
@@ -557,6 +682,91 @@ mod tests {
             .unwrap();
         assert!(!full.truncated);
         assert!(full.text.len() > p.text.len());
+    }
+
+    #[test]
+    fn strict_patch_zero_budget_is_empty_and_truncated() {
+        let (t, [_, _, c3]) = three_commits();
+        t.write_untracked("a.txt", "changed\n");
+        let p = t
+            .open()
+            .workdir_patch_limited(
+                c3,
+                Path::new("a.txt"),
+                &PatchOptions {
+                    max_output_bytes: 0,
+                    ..PatchOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(p.text.is_empty());
+        assert!(p.truncated);
+        assert!(!p.input_limited && !p.cancelled);
+    }
+
+    #[test]
+    fn strict_patch_never_exceeds_the_output_limit_even_mid_utf8() {
+        let t = TempRepo::new();
+        let c = t.commit_file("cn.txt", "一\n二\n三\n", "cn");
+        t.write_untracked("cn.txt", "四\n五\n六\n");
+        for limit in [1, 2, 3, 4, 5, 6, 7, 8, 9] {
+            let p = t
+                .open()
+                .workdir_patch_limited(
+                    c,
+                    Path::new("cn.txt"),
+                    &PatchOptions {
+                        max_output_bytes: limit,
+                        ..PatchOptions::default()
+                    },
+                )
+                .unwrap();
+            assert!(p.text.len() <= limit, "limit={limit} got {}", p.text.len());
+            assert!(p.truncated || p.text.len() < limit);
+            // 结果仍是合法 UTF-8(String),没有在字符中间截断出非法字节。
+            assert!(std::str::from_utf8(p.text.as_bytes()).is_ok());
+        }
+    }
+
+    #[test]
+    fn strict_patch_input_budget_is_a_typed_limited_result() {
+        let (t, [_, _, c3]) = three_commits();
+        let p = t
+            .open()
+            .workdir_patch_limited(
+                c3,
+                Path::new("a.txt"),
+                &PatchOptions {
+                    max_output_bytes: 1024,
+                    max_input_bytes: 1,
+                    ..PatchOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(p.input_limited);
+        assert!(p.text.is_empty());
+        assert!(!p.cancelled);
+    }
+
+    #[test]
+    fn strict_patch_honors_a_pre_cancelled_flag() {
+        let (t, [_, _, c3]) = three_commits();
+        t.write_untracked("a.txt", "changed\n");
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let p = t
+            .open()
+            .workdir_patch_limited(
+                c3,
+                Path::new("a.txt"),
+                &PatchOptions {
+                    max_output_bytes: 1024,
+                    cancel: Some(cancel),
+                    ..PatchOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(p.cancelled);
+        assert!(p.text.is_empty());
     }
 
     #[test]
