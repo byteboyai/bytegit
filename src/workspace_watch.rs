@@ -23,7 +23,7 @@
 //! [`WorkspaceChangeKind::FULL_RESCAN`],由调用方重新 discover 并重建监听(本 API 不在
 //! 内部自动换身份)。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -188,7 +188,6 @@ impl WorkspaceChange {
 
 /// 存活的工作区监听器。
 pub struct WorkspaceWatchHandle {
-    _watcher: notify::RecommendedWatcher,
     shared: Arc<Shared>,
     stopped: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
@@ -255,15 +254,13 @@ pub fn watch_workspace(
     let stopped = Arc::new(AtomicBool::new(false));
 
     let callback_shared = shared.clone();
+    let filter = classifier.clone();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         let raw = match res {
             Ok(event) => {
                 // 「文件被打开/读取」不是变更:Linux 的 inotify 会报它,自身读文件会反过来
                 // 触发刷新。
-                if matches!(event.kind, notify::EventKind::Access(_)) {
-                    return;
-                }
-                classifier.classify_event(&event)
+                filter.classify_event(&event)
             }
             Err(e) => RawChange::global_error(e.to_string()),
         };
@@ -281,25 +278,35 @@ pub fn watch_workspace(
     watcher.watch(&workdir, notify::RecursiveMode::Recursive)?;
 
     let mut degraded = Vec::new();
+    let mut watched = BTreeSet::new();
+    let mut failures = BTreeMap::new();
     for target in targets {
         if let Err(e) = watcher.watch(&target.path, target.mode) {
+            failures.insert(target.path.clone(), e.to_string());
             degraded.push(WatchDegraded {
                 path: Some(target.path),
                 message: e.to_string(),
             });
+        } else {
+            watched.insert(target.path);
         }
     }
+    let monitor = TargetMonitor {
+        watcher,
+        classifier,
+        watched,
+        failures,
+    };
 
     let thread_shared = shared.clone();
     let thread_stopped = stopped.clone();
     let worker = thread::Builder::new()
         .name("bytegit-workspace-watch".into())
-        .spawn(move || worker_loop(thread_shared, thread_stopped, on_change))
+        .spawn(move || worker_loop(thread_shared, thread_stopped, monitor, on_change))
         .map_err(|e| GitError::new(GitErrorKind::Io, format!("启动监听线程失败: {e}")))?;
     let worker_id = worker.thread().id();
 
     Ok(WorkspaceWatchHandle {
-        _watcher: watcher,
         shared,
         stopped,
         worker: Some(worker),
@@ -317,43 +324,112 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn worker_loop(
-    shared: Arc<Shared>,
-    stopped: Arc<AtomicBool>,
-    mut on_change: impl FnMut(WorkspaceChange),
-) {
-    loop {
-        let change = {
-            let mut state = lock(&shared.state);
-            loop {
-                if stopped.load(Ordering::SeqCst) {
-                    return;
+/// 额外目录由 worker 持有和重建,不递归监听整个 objects。
+struct TargetMonitor {
+    watcher: notify::RecommendedWatcher,
+    classifier: Classifier,
+    watched: BTreeSet<PathBuf>,
+    failures: BTreeMap<PathBuf, String>,
+}
+
+impl TargetMonitor {
+    fn refresh(&mut self, force: bool) -> RawChange {
+        let targets = extra_targets(&self.classifier);
+        let desired: BTreeSet<_> = targets.iter().map(|t| t.path.clone()).collect();
+        let mut raw = RawChange::default();
+        let removed: Vec<_> = self.watched.difference(&desired).cloned().collect();
+        for path in removed {
+            let _ = self.watcher.unwatch(&path);
+            self.watched.remove(&path);
+            raw.kinds.insert(WorkspaceChangeKind::FULL_RESCAN);
+        }
+        self.failures.retain(|path, _| desired.contains(path));
+        for target in targets {
+            let existing = self.watched.contains(&target.path);
+            if existing && !force && target.path.is_dir() {
+                continue;
+            }
+            if existing {
+                let _ = self.watcher.unwatch(&target.path);
+            }
+            match self.watcher.watch(&target.path, target.mode) {
+                Ok(()) => {
+                    self.watched.insert(target.path.clone());
+                    let recovered = self.failures.remove(&target.path).is_some();
+                    if !existing || recovered {
+                        // 监听未就绪期间可能漏事件,成功挂回后必须补扫。
+                        raw.kinds.insert(WorkspaceChangeKind::FULL_RESCAN);
+                    }
                 }
-                let now = Instant::now();
-                match state.deadline() {
-                    Some(deadline) if now >= deadline => {
-                        if let Some(change) = state.take() {
-                            break change;
-                        }
-                    }
-                    Some(deadline) => {
-                        let (guard, _) = shared
-                            .wake
-                            .wait_timeout(state, deadline - now)
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        state = guard;
-                    }
-                    None => {
-                        let (guard, _) = shared
-                            .wake
-                            .wait_timeout(state, STOP_POLL)
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        state = guard;
+                Err(error) => {
+                    self.watched.remove(&target.path);
+                    let message = error.to_string();
+                    if self.failures.get(&target.path) != Some(&message) {
+                        self.failures.insert(target.path.clone(), message.clone());
+                        raw.kinds.insert(WorkspaceChangeKind::FULL_RESCAN);
+                        raw.degraded.push(WatchDegraded {
+                            path: Some(target.path),
+                            message,
+                        });
                     }
                 }
             }
+        }
+        raw
+    }
+}
+
+fn worker_loop(
+    shared: Arc<Shared>,
+    stopped: Arc<AtomicBool>,
+    mut monitor: TargetMonitor,
+    mut on_change: impl FnMut(WorkspaceChange),
+) {
+    loop {
+        if stopped.load(Ordering::SeqCst) {
+            return;
+        }
+        // 仅检查几个控制目录,缺失目录创建后也会自动接线;不扫描对象树。
+        let maintenance = monitor.refresh(false);
+        let change = {
+            let mut state = lock(&shared.state);
+            if !maintenance.is_empty() {
+                state.push(maintenance, Instant::now());
+            }
+            if stopped.load(Ordering::SeqCst) {
+                return;
+            }
+            let now = Instant::now();
+            match state.deadline() {
+                Some(deadline) if now >= deadline => state.take(),
+                deadline => {
+                    let wait = deadline.map_or(STOP_POLL, |d| (d - now).min(STOP_POLL));
+                    let _guard = shared
+                        .wake
+                        .wait_timeout(state, wait)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    None
+                }
+            }
         };
-        on_change(change);
+        if let Some(change) = change {
+            if change.is_full_rescan()
+                || change
+                    .paths
+                    .iter()
+                    .any(|path| monitor.watched.contains(path))
+            {
+                // 目录被替换时后端可能已撤销旧 watch,即使同路径已重建也要重挂。
+                let repair = monitor.refresh(true);
+                if !repair.is_empty() {
+                    lock(&shared.state).push(repair, Instant::now());
+                }
+            }
+            if stopped.load(Ordering::SeqCst) {
+                return;
+            }
+            on_change(change);
+        }
     }
 }
 
@@ -391,6 +467,7 @@ impl RawChange {
     }
 }
 
+#[derive(Clone)]
 struct Classifier {
     workdir: PathBuf,
     workdir_aliases: Vec<PathBuf>,
@@ -428,6 +505,14 @@ impl Classifier {
 
     fn classify_event(&self, event: &notify::Event) -> RawChange {
         let mut raw = RawChange::default();
+        // 丢事件提示优先于 Access 和路径过滤,明细不能代表完整的变化集合。
+        if event.need_rescan() {
+            raw.kinds.insert(WorkspaceChangeKind::FULL_RESCAN);
+            return raw;
+        }
+        if matches!(event.kind, notify::EventKind::Access(_)) {
+            return raw;
+        }
         if event.paths.is_empty() {
             // 路径为空的 rescan/后端事件不能解释成"没有变化"。
             raw.kinds.insert(WorkspaceChangeKind::FULL_RESCAN);
@@ -663,6 +748,10 @@ fn extra_targets(classifier: &Classifier) -> Vec<Target> {
     add(classifier.git_dir.clone(), Recursive);
     if !classifier.shares_common && !classifier.common_dir.starts_with(&classifier.git_dir) {
         add(classifier.common_dir.clone(), NonRecursive);
+        // 这些目录中的文件会改变 ignore/attributes 或历史解释。
+        // 缺失/无法监听时显式降级,worker 定期重试并在恢复后补扫。
+        add(classifier.common_dir.join("info"), NonRecursive);
+        add(classifier.common_dir.join("objects/info"), NonRecursive);
         let refs = classifier.common_dir.join("refs");
         if refs.exists() {
             add(refs, Recursive);
@@ -1507,6 +1596,58 @@ mod tests {
         assert_eq!(err.kind(), GitErrorKind::NotARepo);
     }
 
+    #[test]
+    fn linked_worktree_shared_configuration_survives_directory_recreation() {
+        if !fs_events_supported() {
+            eprintln!("SKIP: filesystem notifications unavailable");
+            return;
+        }
+        let main = TempRepo::new();
+        main.commit_file("a.txt", "one\n", "init");
+        let temp = tempfile::tempdir().unwrap();
+        let wt = temp.path().join("wt");
+        let result = Command::new("git")
+            .args(["worktree", "add", "--detach"])
+            .arg(&wt)
+            .current_dir(main.path())
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{result:?}");
+        let identity = crate::Repo::discover_workdir(&wt)
+            .unwrap()
+            .identity()
+            .unwrap();
+        let info = identity.common_dir().join("info");
+        let exclude = info.join("exclude");
+        let alternates = identity.common_dir().join("objects/info/alternates");
+        let (handle, rx, _) = start(&identity);
+        assert!(handle.degraded().is_empty(), "{:?}", handle.degraded());
+        std::fs::write(&exclude, "generated/\n").unwrap();
+        recv_until(&rx, Duration::from_secs(5), |c| {
+            c.kinds.contains(WorkspaceChangeKind::CONFIG) && c.paths.contains(&exclude)
+        })
+        .expect("shared exclude changes must be observed");
+        std::fs::write(&alternates, "").unwrap();
+        recv_until(&rx, Duration::from_secs(5), |c| {
+            c.kinds.contains(WorkspaceChangeKind::HISTORY_BOUNDARY) && c.paths.contains(&alternates)
+        })
+        .expect("shared alternates changes must be observed");
+        std::fs::remove_dir_all(&info).unwrap();
+        recv_until(&rx, Duration::from_secs(5), |c| {
+            c.is_full_rescan() && c.degraded.iter().any(|d| d.path.as_ref() == Some(&info))
+        })
+        .expect("removed shared directory must report degraded state");
+        std::fs::create_dir(&info).unwrap();
+        recv_until(&rx, Duration::from_secs(5), |c| c.is_full_rescan())
+            .expect("recreated directory must reattach and request catch-up");
+        std::fs::write(&exclude, "fresh/\n").unwrap();
+        recv_until(&rx, Duration::from_secs(5), |c| {
+            c.kinds.contains(WorkspaceChangeKind::CONFIG) && c.paths.contains(&exclude)
+        })
+        .expect("changes after directory recreation must be observed");
+        handle.shutdown().unwrap();
+    }
+
     fn init_repo(path: &Path) {
         let repo = git2::Repository::init(path).unwrap();
         repo.set_head("refs/heads/main").unwrap();
@@ -1515,5 +1656,74 @@ mod tests {
     fn fake_real_identity(path: &Path) -> RepoIdentity {
         let path = path.canonicalize().unwrap();
         RepoIdentity::for_test(Some(path.clone()), path.join(".git"), path.join(".git"))
+    }
+}
+
+#[cfg(test)]
+mod rescan_regressions {
+    use super::*;
+    #[test]
+    fn rescan_flag_must_override_an_irrelevant_path() {
+        let id = RepoIdentity::for_test(Some("/r".into()), "/r/.git".into(), "/r/.git".into());
+        let c = Classifier::new(&id).unwrap();
+        let event = notify::Event::new(notify::EventKind::Other)
+            .add_path("/r/.git/objects/x".into())
+            .set_flag(notify::event::Flag::Rescan);
+        assert!(event.need_rescan());
+        assert!(
+            c.classify_event(&event)
+                .kinds
+                .contains(WorkspaceChangeKind::FULL_RESCAN),
+            "backend requested rescan but classifier discarded it"
+        );
+    }
+}
+
+#[cfg(test)]
+mod target_regressions {
+    use super::*;
+    #[test]
+    fn linked_worktree_must_watch_common_exclude() {
+        let id = RepoIdentity::for_test(
+            Some("/w".into()),
+            "/main/.git/worktrees/w".into(),
+            "/main/.git".into(),
+        );
+        let c = Classifier::new(&id).unwrap();
+        let targets = extra_targets(&c);
+        let excluded = Path::new("/main/.git/info/exclude");
+        assert!(
+            targets.iter().any(|t| match t.mode {
+                notify::RecursiveMode::Recursive => excluded.starts_with(&t.path),
+                notify::RecursiveMode::NonRecursive => excluded.parent() == Some(t.path.as_path()),
+            }),
+            "common info/exclude is classified as CONFIG but has no watcher target: {targets:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod notification_priority_tests {
+    use super::*;
+    #[test]
+    fn rescan_precedes_access_and_relevant_path_classification() {
+        let id = RepoIdentity::for_test(Some("/r".into()), "/r/.git".into(), "/r/.git".into());
+        let c = Classifier::new(&id).unwrap();
+        for kind in [
+            notify::EventKind::Any,
+            notify::EventKind::Access(notify::event::AccessKind::Any),
+        ] {
+            for path in ["/r/source.rs", "/r/.git/objects/x"] {
+                let event = notify::Event::new(kind)
+                    .add_path(path.into())
+                    .set_flag(notify::event::Flag::Rescan);
+                let raw = c.classify_event(&event);
+                assert_eq!(raw.kinds, WorkspaceChangeKind::FULL_RESCAN);
+                assert!(raw.paths.is_empty());
+            }
+        }
+        let read = notify::Event::new(notify::EventKind::Access(notify::event::AccessKind::Any))
+            .add_path("/r/source.rs".into());
+        assert!(c.classify_event(&read).is_empty());
     }
 }
