@@ -9,9 +9,9 @@ ByteBoy 系产品(Dozer、Digger……)共用的**本地 Git 底层库**。
 ## 依赖
 
 ```toml
-bytegit = { git = "https://github.com/byteboyai/bytegit", tag = "v0.9.0" }
+bytegit = { git = "https://github.com/byteboyai/bytegit", tag = "v0.9.1" }
 # 下游测试里要用确定性临时仓库夹具:
-# bytegit = { git = "...", tag = "v0.9.0", features = ["testutil"] }
+# bytegit = { git = "...", tag = "v0.9.1", features = ["testutil"] }
 ```
 
 一律用 tag。本地联调在使用方的 `.cargo/config.toml` 里(不提交):
